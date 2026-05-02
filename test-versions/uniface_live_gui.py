@@ -1,12 +1,14 @@
 import os
-import socket
 import time
 import hashlib
 import threading
 
 import cv2
 import numpy as np
-from uniface import FaceAnalyzer
+from uniface.detection import RetinaFace
+from uniface.recognition import ArcFace
+from uniface.tracking import BYTETracker
+from uniface import compute_similarity
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
@@ -29,12 +31,9 @@ DB_PATH = "face-db"
 CACHE_FILE = os.path.join(DB_PATH, "face_cache.npy")
 SIGNATURE_FILE = os.path.join(DB_PATH, "face_cache_sig.txt")
 
-try:
-    analyzer = FaceAnalyzer(providers=["CUDAExecutionProvider"])
-except TypeError:
-    analyzer = FaceAnalyzer()
-except Exception:
-    analyzer = FaceAnalyzer()
+detector = RetinaFace()
+recognizer = ArcFace()
+tracker = BYTETracker(track_thresh=0.5, track_buffer=30)
 
 
 def get_db_signature(path=DB_PATH):
@@ -72,15 +71,16 @@ def load_face_database(path=DB_PATH):
                 continue
 
             img = cv2.resize(img, (480, 480))
-            results = analyzer.analyze(img)
+            faces = detector.detect(img)
 
-            if len(results) == 0:
+            if len(faces) == 0:
                 print(f"⚠️ No face found in {img_path}")
                 continue
 
-            face = results[0]
-            if hasattr(face, "embedding"):
-                db[person_name].append(face.embedding)
+            face = faces[0]
+            if face.landmarks is not None:
+                embedding = recognizer.get_normalized_embedding(img, face.landmarks)
+                db[person_name].append(embedding)
                 print(f"✅ Loaded {file} for {person_name}")
 
     return db
@@ -109,21 +109,6 @@ known_faces = load_or_build_db()
 db_lock = threading.Lock()
 
 
-def add_face(name, embedding):
-    with db_lock:
-        if name not in known_faces:
-            known_faces[name] = []
-        known_faces[name].append(embedding)
-        np.save(CACHE_FILE, known_faces)
-        with open(SIGNATURE_FILE, "w") as f:
-            f.write(get_db_signature(DB_PATH))
-    print(f"✅ Saved face for {name} (total: {len(known_faces[name])})")
-
-
-def cosine_similarity(a, b):
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-
-
 def recognize_face(embedding, threshold=0.5):
     best_match = "Unknown"
     best_score = 0
@@ -134,7 +119,7 @@ def recognize_face(embedding, threshold=0.5):
     with db_lock:
         for name, embeddings in known_faces.items():
             for ref_emb in embeddings:
-                score = cosine_similarity(embedding, ref_emb)
+                score = compute_similarity(embedding, ref_emb, normalized=True)
                 if score > best_score:
                     best_score = score
                     best_match = name
@@ -190,7 +175,6 @@ class VideoWorker(QThread):
         self.source_name = source_name
         self.stream_url = stream_url
         self._running = False
-        self.track_identities = {}
 
     def run(self):
         cap = cv2.VideoCapture(self.stream_url)
@@ -206,8 +190,10 @@ class VideoWorker(QThread):
                 time.sleep(0.05)
                 continue
 
-            results = analyzer.analyze(frame)
-            frame = self.process_faces(frame, results)
+            faces = detector.detect(frame)
+            dets = np.array([[*f.bbox, f.confidence] for f in faces]) if faces else np.empty((0, 5))
+            tracks = tracker.update(dets)
+            frame = self.process_faces(frame, faces, tracks)
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb.shape
@@ -219,7 +205,7 @@ class VideoWorker(QThread):
                     "embedding": getattr(face, "embedding", None),
                     "bbox": tuple(map(int, face.bbox)),
                 }
-                for face in results
+                for face in faces
             ]
             self.frame_ready.emit(self.source_name, qimg, face_data)
 
@@ -229,38 +215,23 @@ class VideoWorker(QThread):
         self._running = False
         self.wait()
 
-    def process_faces(self, frame, results):
-        now = time.time()
-        self.track_identities = {
-            tid: data
-            for tid, data in self.track_identities.items()
-            if now - data["last_seen"] < MAX_AGE
-        }
-
-        for face in results:
-            embedding = getattr(face, "embedding", None)
-            track_id = getattr(face, "track_id", None)
+    def process_faces(self, frame, faces, tracks):
+        for face in faces:
+            embedding = None
+            if face.landmarks is not None:
+                embedding = recognizer.get_normalized_embedding(frame, face.landmarks)
             name = "Unknown"
+            if is_good_embedding(embedding):
+                name = recognize_face(embedding)
 
-            if track_id is not None:
-                if track_id in self.track_identities:
-                    name = self.track_identities[track_id]["name"]
-                    if is_good_embedding(embedding):
-                        new_name = recognize_face(embedding)
-                        if new_name != "Unknown":
-                            self.track_identities[track_id]["name"] = new_name
-                            name = new_name
-                else:
-                    if is_good_embedding(embedding):
-                        name = recognize_face(embedding)
-                    self.track_identities[track_id] = {
-                        "name": name,
-                        "last_seen": now,
-                    }
-                self.track_identities[track_id]["last_seen"] = now
-            else:
-                if is_good_embedding(embedding):
-                    name = recognize_face(embedding)
+            # Assign track_id from ByteTrack
+            if len(tracks) > 0:
+                face_centers = np.array([f.bbox[:2] + np.array(f.bbox[2:]) / 2 for f in faces])
+                track_centers = tracks[:, :2] + tracks[:, 2:4] / 2
+                for ti, track in enumerate(tracks):
+                    dists = np.sum((track_centers[ti] - face_centers) ** 2, axis=1)
+                    closest_idx = np.argmin(dists)
+                    faces[closest_idx].track_id = int(track[4])
 
             self.draw_overlay(frame, face, name)
 
@@ -281,96 +252,6 @@ class VideoWorker(QThread):
                 (255, 0, 255),
                 2,
             )
-
-
-class LANScanner(QThread):
-    scan_result = pyqtSignal(list)
-    status = pyqtSignal(str)
-
-    def __init__(self):
-        super().__init__()
-        self._running = False
-
-    def run(self):
-        self._running = True
-        local_ip = self.get_local_ip()
-        if local_ip is None:
-            self.status.emit("Unable to determine local LAN IP")
-            return
-
-        base = ".".join(local_ip.split(".")[:3])
-        self.status.emit(f"Scanning LAN {base}.x ...")
-
-        last_octet = int(local_ip.split(".")[-1])
-        start = max(1, last_octet - 20)
-        end = min(254, last_octet + 20)
-        candidates = [f"{base}.{i}" for i in range(start, end + 1) if i != last_octet]
-
-        found_sources = []
-        for ip in candidates:
-            if not self._running:
-                break
-            if not self.host_has_open_port(ip, [80, 8080, 554, 8554]):
-                continue
-
-            for url in self.common_stream_urls(ip):
-                if not self._running:
-                    break
-                if self.try_open_stream(url):
-                    found_sources.append((f"Camera {len(found_sources) + 1}", url))
-                    break
-
-        if found_sources:
-            self.scan_result.emit(found_sources)
-            self.status.emit(f"Detected {len(found_sources)} camera(s)")
-        else:
-            self.status.emit("No cameras found")
-
-    def get_local_ip(self):
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.connect(("8.8.8.8", 80))
-            local_ip = sock.getsockname()[0]
-            sock.close()
-            return local_ip
-        except Exception:
-            return None
-
-    def host_has_open_port(self, host, ports):
-        for port in ports:
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(0.12)
-                sock.connect((host, port))
-                sock.close()
-                return True
-            except Exception:
-                continue
-        return False
-
-    def common_stream_urls(self, ip):
-        return [
-            f"http://{ip}/video",
-            f"http://{ip}:8080/video",
-            f"http://{ip}:81/video",
-            f"http://{ip}:80/video",
-            f"rtsp://{ip}/stream",
-            f"rtsp://{ip}:554/stream",
-            f"rtsp://{ip}:8554/live",
-            f"rtsp://{ip}:8554/0",
-        ]
-
-    def try_open_stream(self, url):
-        cap = cv2.VideoCapture(url)
-        if not cap.isOpened():
-            cap.release()
-            return False
-
-        ret, _ = cap.read()
-        cap.release()
-        return bool(ret)
-
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -378,7 +259,6 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1200, 780)
 
         self.sources = {}
-        self.last_face_data = {}
 
         self.source_name_input = QLineEdit()
         self.source_name_input.setPlaceholderText("Source name")
@@ -399,9 +279,6 @@ class MainWindow(QMainWindow):
         self.remove_source_button.clicked.connect(self.remove_selected_source)
         self.remove_source_button.setEnabled(False)
 
-        self.auto_detect_button = QPushButton("Auto-Detect Cameras")
-        self.auto_detect_button.clicked.connect(self.auto_detect_sources)
-
         self.refresh_button = QPushButton("Refresh DB")
         self.refresh_button.clicked.connect(self.reload_database)
 
@@ -421,17 +298,13 @@ class MainWindow(QMainWindow):
         source_action_layout.addWidget(self.start_all_button)
         source_action_layout.addWidget(self.stop_all_button)
         source_action_layout.addWidget(self.remove_source_button)
-
-        scan_action_layout = QHBoxLayout()
-        scan_action_layout.addWidget(self.auto_detect_button)
-        scan_action_layout.addWidget(self.refresh_button)
+        source_action_layout.addWidget(self.refresh_button)
 
         left_panel = QVBoxLayout()
         left_panel.addWidget(QLabel("Sources"))
         left_panel.addWidget(self.source_list, stretch=1)
         left_panel.addLayout(source_controls_layout)
         left_panel.addLayout(source_action_layout)
-        left_panel.addLayout(scan_action_layout)
         left_panel.addSpacing(12)
         left_panel.addWidget(self.status_label)
 
@@ -552,39 +425,12 @@ class MainWindow(QMainWindow):
         self.remove_source_button.setEnabled(self.source_list.currentItem() is not None)
         self.status_label.setText(f"Removed source: {source_name}")
 
-    def auto_detect_sources(self):
-        self.scan_thread = LANScanner()
-        self.scan_thread.scan_result.connect(self.on_scan_complete)
-        self.scan_thread.status.connect(self.on_scan_status)
-        self.scan_thread.finished.connect(lambda: self.auto_detect_button.setEnabled(True))
-        self.auto_detect_button.setEnabled(False)
-        self.status_label.setText("Scanning LAN for cameras...")
-        self.scan_thread.start()
-
-    def on_scan_complete(self, detected_sources):
-        for name, url in detected_sources:
-            if name in self.sources:
-                continue
-            panel = VideoPanel(name)
-            self.sources[name] = {
-                "url": url,
-                "worker": None,
-                "panel": panel,
-            }
-            self.source_list.addItem(QListWidgetItem(name))
-        self.update_video_layout()
-        self.auto_detect_button.setEnabled(True)
-
-    def on_scan_status(self, message):
-        self.status_label.setText(message)
-
     def on_frame_ready(self, source_name, image, face_data):
         source = self.sources.get(source_name)
         if not source:
             return
 
         source["panel"].update_frame(image)
-        self.last_face_data[source_name] = face_data
         source["panel"].set_status(f"Faces: {len(face_data)}")
         self.status_label.setText(f"{source_name}: {len(face_data)} faces")
 
